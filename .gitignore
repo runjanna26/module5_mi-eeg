@@ -1,0 +1,11 @@
+.ipynb_checkpoints
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+experiments/datasets/
+experiments/logs/
+mixnet_bci.egg-info/
+.DS_Store
+.pypirc
