@@ -53,6 +53,8 @@ Data you must return
 import os
 
 import numpy as np
+from scipy.linalg import eigh
+from scipy.signal import butter, sosfiltfilt
 from sklearn.model_selection import StratifiedKFold
 
 from mixnet.preprocessing.BCIC2a import raw
@@ -68,6 +70,113 @@ MI_len = CONSTANT['MI']['len']
 # `--data_type` argument of run_HWNet.py. Keep it as is.
 DATA_TYPE = 'HW_prep'
 
+# Defaults of the pipeline; every one can be overridden from prep_HW.py.
+BANDS = [(4, 8), (8, 12), (12, 16), (16, 20), (20, 24), (24, 28), (28, 32),
+         (32, 36), (36, 40)]          # same filter bank as FBCSP / MixNet
+N_PAIRS = 1                           # CSP pairs per band (1 pair = 2 filters); 0 = no CSP
+FILTER_ORDER = 4
+EPS = 1e-8
+
+
+def _bandpass(X, lo, hi, fs, order=FILTER_ORDER):
+    """Zero-phase Butterworth band-pass along time. Stateless: the coefficients
+    depend only on (lo, hi, fs), and each trial is filtered on its own."""
+    sos = butter(order, [lo, hi], btype='bandpass', fs=fs, output='sos')
+    return sosfiltfilt(sos, X, axis=-1)
+
+
+def _trial_covs(Xb, y, c):
+    """Trace-normalised covariance of every trial of class c: (n_c, ch, ch)."""
+    out = []
+    for i in np.where(y == c)[0]:
+        cov = Xb[i] @ Xb[i].T
+        out.append(cov / np.trace(cov))
+    return np.stack(out)
+
+
+def _lw_shrinkage(covs, mean):
+    """Ledoit-Wolf shrinkage intensity of the mean of per-trial covariances.
+
+    The mean is an estimate built from n noisy matrices; the shrinkage target is
+    mu * I with mu = trace(mean) / ch. Intensity = (variance of the estimate) /
+    (squared distance of the estimate from the target), clipped to [0, 1]
+    (Ledoit & Wolf, 2004). Estimated from the data it is given, so call it with
+    training-fold trials only.
+    """
+    n, ch = covs.shape[0], covs.shape[1]
+    mu = np.trace(mean) / ch
+    d2 = np.sum((mean - mu * np.eye(ch)) ** 2)
+    b2 = np.sum((covs - mean) ** 2) / n ** 2
+    return float(np.clip(b2 / max(d2, 1e-30), 0.0, 1.0))
+
+
+def _matrix_abs(A):
+    """|A| = V |D| V^T for a symmetric matrix."""
+    vals, vecs = np.linalg.eigh(A)
+    return (vecs * np.abs(vals)) @ vecs.T
+
+
+def _fit_csp(Xb, y, n_pairs, shrinkage=0.0, csp='csp', alpha=0.0):
+    """CSP filters of one band. LEARNED -- call with training-fold trials only.
+
+    Xb: (n, ch, t) band-passed trials, y: (n,) labels in {0, 1}.
+    Returns (2 * n_pairs, ch): the filters whose output variance is smallest
+    and largest for class 0 relative to both classes together.
+
+    csp='csp'   plain CSP; `shrinkage` pulls each class covariance toward a
+                scaled identity by a fixed fraction.
+    csp='lw'    the same, with the fraction estimated per class by Ledoit-Wolf.
+    csp='scsp'  stationary CSP (Samek et al., 2012): the denominator gets a
+                penalty that grows with how much a filter's power varies from
+                trial to trial. `alpha` is the penalty's weight relative to the
+                total covariance.
+    """
+    n_ch = Xb.shape[1]
+    covs, per_trial = [], []
+    for c in (0, 1):
+        tc = _trial_covs(Xb, y, c)
+        C = tc.mean(axis=0)
+        k = _lw_shrinkage(tc, C) if csp == 'lw' else shrinkage
+        # With ~58 trials per class and 20 channels the class covariance is
+        # noisy, and CSP overfits to that noise; shrink toward a scaled identity.
+        covs.append((1.0 - k) * C + k * np.trace(C) / n_ch * np.eye(n_ch))
+        per_trial.append((tc, C))
+    total = covs[0] + covs[1]
+    if csp == 'scsp' and alpha > 0:
+        pen = sum(np.mean([_matrix_abs(ci - C) for ci in tc], axis=0) for tc, C in per_trial)
+        total = total + alpha * pen * np.trace(total) / np.trace(pen)
+    elif csp not in ('csp', 'lw', 'scsp'):
+        raise ValueError('Unknown csp: {}'.format(csp))
+    # Generalised eigenproblem C0 w = lambda (C0 + C1 [+ penalty]) w.
+    # The ridge is scaled to the matrix so it only matters if `total` is singular.
+    ridge = EPS * np.trace(total) / n_ch
+    vals, vecs = eigh(covs[0], total + ridge * np.eye(n_ch))
+    order = np.argsort(vals)
+    pick = np.r_[order[:n_pairs], order[-n_pairs:]]
+    return vecs[:, pick].T
+
+
+def _signals(X, filters, bands, fs, trial_norm='none'):
+    """Band-pass every band and, if CSP filters are given, project on them.
+    Learns nothing: `filters` are supplied by the caller.
+
+    trial_norm='band' divides the signals of each band by the root-mean-square
+    amplitude of that band in the same trial. It uses one trial at a time, so it
+    is stateless. It removes the overall power of the band, which changes from
+    day to day, and keeps the balance between the CSP filters, which is what
+    separates the classes.
+    Returns (n, n_signals, t) with the bands stacked along the signal axis."""
+    out = []
+    for b, (lo, hi) in enumerate(bands):
+        Xb = _bandpass(X, lo, hi, fs)
+        Z = Xb if filters is None else np.einsum('kc,nct->nkt', filters[b], Xb)
+        if trial_norm == 'band':
+            Z = Z / (np.sqrt((Z ** 2).mean(axis=(1, 2), keepdims=True)) + EPS)
+        elif trial_norm != 'none':
+            raise ValueError('Unknown trial_norm: {}'.format(trial_norm))
+        out.append(Z)
+    return np.concatenate(out, axis=1)
+
 
 # =============================================================================
 #  TODO 1 / 2 -- fit on the training fold and transform it
@@ -75,7 +184,8 @@ DATA_TYPE = 'HW_prep'
 #  NOTE: you are allowed to add any extra arguments to `fit_transform()` and `transform()`
 #  but you must NOT change the signature of `subject_dependent_setting()`.
 # =============================================================================
-def fit_transform(X, y, pick_smp_freq, **kwargs):
+def fit_transform(X, y, pick_smp_freq, bands=None, n_pairs=N_PAIRS, shrinkage=0.0,
+                  trial_norm='none', unit_scale=True, csp='csp', alpha=0.0, **kwargs):
     """Learn the pipeline parameters on the TRAINING fold and transform it.
 
     Called once per (subject, fold) with the training split only.
@@ -101,10 +211,28 @@ def fit_transform(X, y, pick_smp_freq, **kwargs):
         NOTE: You can also add your own helper functions in this file or in
         `mixnet/preprocessing/BCIC2a/HW_prep_helpers.py` if you want to keep this file clean.
     """
-    raise NotImplementedError(
-        'HOMEWORK: implement fit_transform() in '
-        'mixnet/preprocessing/BCIC2a/HW_prep.py'
-    )
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y).ravel()
+    fs = pick_smp_freq
+    bands = [tuple(b) for b in (BANDS if bands is None else bands)]
+
+    # Learned step 1 (optional): CSP filters per band, from the training fold.
+    filters = None
+    if n_pairs > 0:
+        filters = [_fit_csp(_bandpass(X, lo, hi, fs), y, n_pairs, shrinkage, csp, alpha)
+                   for lo, hi in bands]
+    sig = _signals(X, filters, bands, fs, trial_norm)        # (n, n_signals, t)
+
+    # Learned step 2: one scale per signal (its standard deviation over all
+    # training-fold trials and samples), so the reservoir input has unit scale.
+    scale = sig.std(axis=(0, 2), keepdims=True) + EPS
+    if not unit_scale:                                       # ablation only
+        scale = np.ones_like(scale)
+
+    state = {'filters': filters, 'scale': scale, 'bands': bands, 'fs': fs,
+             'trial_norm': trial_norm}
+    # time first: (n, t, n_signals), the layout a recurrent layer expects
+    return np.transpose(sig / scale, (0, 2, 1)).astype(np.float32), state
 
 
 # =============================================================================
@@ -130,10 +258,13 @@ def transform(X, state, pick_smp_freq, **kwargs):
         X_out (np.ndarray): (n_trials, ...) features with the SAME trailing
             shape as the output of `fit_transform()`.
     """
-    raise NotImplementedError(
-        'HOMEWORK: implement transform() in '
-        'mixnet/preprocessing/BCIC2a/HW_prep.py'
-    )
+    if pick_smp_freq != state['fs']:
+        raise ValueError('transform() got pick_smp_freq={} but the pipeline was '
+                         'fitted at {} Hz'.format(pick_smp_freq, state['fs']))
+    X = np.asarray(X, dtype=np.float64)
+    # Everything data-driven comes from `state`; nothing is re-estimated here.
+    sig = _signals(X, state['filters'], state['bands'], state['fs'], state['trial_norm'])
+    return np.transpose(sig / state['scale'], (0, 2, 1)).astype(np.float32)
 
 
 # =============================================================================

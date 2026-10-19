@@ -1,0 +1,12 @@
+{
+ "generation": 20,
+ "val_mse": 0.5634677643541318,
+ "val_acc": 0.8176792556102902,
+ "units": 50,
+ "spectral_radius": 0.6870623260563931,
+ "input_scale": 0.16698196170626198,
+ "leak": 0.7193744143436926,
+ "connectivity": 0.27008713082791835,
+ "ridge_lambda": 101.27411072856005,
+ "direct_inputs": true
+}

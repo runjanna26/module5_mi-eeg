@@ -103,26 +103,115 @@ Read `mixnet/models/EEGNet.py` and `mixnet/models/DeepConvNet.py` for two
 complete, working examples of this same contract.
 """
 
+import numpy as np
+import pandas as pd
 import tensorflow as tf
 from tensorflow.keras import layers
-from tensorflow.keras.constraints import max_norm
 from tensorflow.keras.models import Model
 
 from mixnet import models
 from mixnet.loss import *
 
 
+def reservoir_weights(n_in, units, spectral_radius, input_scale, connectivity, seed):
+    """Fixed random reservoir weights, x(t) = tanh(u(t) W_in + x(t-1) W).
+
+    W is sparse and rescaled to the given spectral radius. Below 1 the state
+    forgets its starting point (echo state property).
+    """
+    rng = np.random.RandomState(seed)
+    w_in = rng.uniform(-input_scale, input_scale, size=(n_in, units))
+    w = rng.uniform(-1.0, 1.0, size=(units, units))
+    w *= rng.uniform(size=w.shape) < connectivity
+    w *= spectral_radius / max(np.max(np.abs(np.linalg.eigvals(w))), 1e-12)
+    return w_in, w
+
+
+class ReservoirCell(layers.Layer):
+    """Leaky reservoir cell, never trained:
+    x(t) = (1 - leak) x(t-1) + leak tanh(u(t) W_in + x(t-1) W)."""
+
+    def __init__(self, units, spectral_radius, leak, input_scale, connectivity, seed,
+                 **kwargs):
+        super().__init__(trainable=False, **kwargs)
+        self.units = units
+        self.state_size = units
+        self.output_size = units
+        self.spectral_radius = spectral_radius
+        self.leak = leak
+        self.input_scale = input_scale
+        self.connectivity = connectivity
+        self.seed = seed
+
+    def build(self, input_shape):
+        w_in, w = reservoir_weights(int(input_shape[-1]), self.units, self.spectral_radius,
+                                    self.input_scale, self.connectivity, self.seed)
+        self.w_in = self.add_weight(name='w_in', shape=w_in.shape, trainable=False,
+                                    initializer=tf.constant_initializer(w_in))
+        self.w = self.add_weight(name='w', shape=w.shape, trainable=False,
+                                 initializer=tf.constant_initializer(w))
+        self.built = True
+
+    def get_config(self):
+        # the checkpoint callback saves the whole model, so the layer must serialise
+        config = super().get_config()
+        config.pop('trainable', None)
+        config.update(units=self.units, spectral_radius=self.spectral_radius, leak=self.leak,
+                      input_scale=self.input_scale, connectivity=self.connectivity,
+                      seed=self.seed)
+        return config
+
+    def call(self, inputs, states):
+        prev = states[0]
+        new = tf.tanh(tf.matmul(inputs, self.w_in) + tf.matmul(prev, self.w))
+        out = (1.0 - self.leak) * prev + self.leak * new
+        return out, [out]
+
+
+class LogVariancePool(layers.Layer):
+    """(batch, time, units) -> (batch, units): log variance over time after the washout."""
+
+    def __init__(self, washout, **kwargs):
+        super().__init__(**kwargs)
+        self.washout = washout
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(washout=self.washout)
+        return config
+
+    def call(self, inputs):
+        x = inputs[:, self.washout:, :]
+        return tf.math.log(tf.math.reduce_variance(x, axis=1) + 1e-8)
+
+
+class MeanPool(layers.Layer):
+    """(batch, time, units) -> (batch, units): mean over time after the washout (ablation)."""
+
+    def __init__(self, washout, **kwargs):
+        super().__init__(**kwargs)
+        self.washout = washout
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(washout=self.washout)
+        return config
+
+    def call(self, inputs):
+        return tf.reduce_mean(inputs[:, self.washout:, :], axis=1)
+
+
 class HWNet(models.base.BaseModel):
 
     def __init__(self,
                  optimizer,
-                 input_shape=(1, 20, 400),
+                 input_shape=(400, 18),
                  num_class=2,
                  loss=[SparseCategoricalCrossentropy()],
                  loss_names=['crossentropy'],
                  loss_weights=[1.0],
                  model_name='HWNet',
-                 data_format='channels_first',
+                 data_format='channels_last',
                  **kwargs):
         super().__init__(num_class, loss, loss_names, loss_weights,
                          optimizer, data_format, **kwargs)
@@ -132,83 +221,118 @@ class HWNet(models.base.BaseModel):
         self._config(**kwargs)
 
     # =========================================================================
-    #  TODO 1 / 2 -- architecture hyper-parameters
+    #  Hyper-parameters
     # =========================================================================
     def _config(self, **kwargs):
-        """Declare every hyper-parameter your `build()` reads as `self.<name>`.
+        """Echo state network: fixed random reservoir + ridge-regression readout.
 
-        Anything you set here can be overridden from
-        `experiments/configs/HWNet.py`, because the loop at the bottom of
-        this method re-applies the keyword arguments coming from the config.
-        That is how you tune a model without editing this file.
-
-        `self.input_shape` is already set. Derive the number of channels and
-        time samples from it -- the layout depends on `data_format`, exactly
-        as in EEGNet:
-
-            channels_first -> input_shape = (depth, n_channels, n_samples)
-            channels_last  -> input_shape = (n_channels, n_samples, depth)
+        input_shape = (n_samples, n_signals), time first as an RNN expects.
         """
-        raise NotImplementedError(
-            'HOMEWORK: implement _config() in mixnet/models/HWNet.py'
-        )
-
-        # Sketch of what a filled-in version looks like -- delete the raise
-        # above and adapt:
-        #
-        # self.F1 = 8
-        # self.kernel_length = 64
-        # self.dropout_rate = 0.5
-        # self.norm_rate = 0.25
-        # if self.data_format == 'channels_first':
-        #     self.Chans, self.Samples = self.input_shape[1], self.input_shape[2]
-        # else:
-        #     self.Chans, self.Samples = self.input_shape[0], self.input_shape[1]
+        self.arch = 'esn'             # 'esn', or 'no_reservoir' (ablation)
+        self.units = 54               # reservoir size N
+        self.spectral_radius = 0.341
+        self.leak = 0.752
+        self.input_scale = 0.0124
+        self.connectivity = 0.315     # fraction of non-zero recurrent weights
+        self.reservoir_seed = 0       # the same reservoir for every subject and fold
+        self.washout = 50             # samples (0.5 s at 100 Hz) dropped before pooling
+        self.skip = False             # also pass the input signals to the pooling
+        self.pool = 'logvar'          # 'logvar', or 'mean' (ablation)
+        self.standardise = True       # standardise pooled features before the readout
+        self.ridge_lambda = 64.49
+        self.n_samples, self.n_signals = self.input_shape
 
         # Keep this last: it lets the experiment config override the defaults.
         for k in kwargs.keys():
             self.__setattr__(k, kwargs[k])
 
     # =========================================================================
-    #  TODO 2 / 2 -- the network itself
+    #  The network
     # =========================================================================
     def build(self, print_summary=True, load_weights=False):
-        """Build and return your architecture as a `tf.keras.models.Model`.
+        """Reservoir (fixed) -> log-variance over time -> linear readout -> softmax.
 
-        Called three times per fold (fit, evaluate, predict), so it must be
-        deterministic and free of side effects.
-
-        Args:
-            print_summary (bool): print `model.summary()` when True.
-            load_weights (bool): restore the best checkpoint of this fold.
-
-        Returns:
-            tf.keras.models.Model with a single (batch, num_class) softmax output.
-
-        Design ideas -- you must be able to explain WHY you chose yours:
-            * temporal conv + depthwise spatial conv (the EEGNet family)
-            * multi-scale / inception-style parallel temporal kernels
-            * separable convolutions + squeeze-and-excitation attention
-            * a small transformer encoder over time windows
-            * a GRU/LSTM head over convolutional features
-            * a plain MLP on the band-power features from Part 1
-
-        Useful regularisers on this dataset (it is small -- ~115 training
-        trials per fold): `max_norm` kernel constraints, dropout,
-        batch normalisation, and keeping the parameter count low.
+        The readout weights are set in closed form by fit(); the standardisation
+        is folded into them, so the graph needs no separate layer for it.
         """
-        raise NotImplementedError(
-            'HOMEWORK: implement build() in mixnet/models/HWNet.py'
-        )
+        input1 = layers.Input(shape=self.input_shape)
 
-        # ---- required epilogue, keep it once your graph is defined ----------
-        # model = Model(inputs=input1, outputs=softmax, name=self.model_name)
-        # if print_summary:
-        #     model.summary()
-        # if load_weights:
-        #     print('loading weights from', self.weights_dir)
-        #     model.load_weights(self.weights_dir)
-        # return model
+        if self.arch == 'esn':
+            cell = ReservoirCell(self.units, self.spectral_radius, self.leak,
+                                 self.input_scale, self.connectivity, self.reservoir_seed,
+                                 name='reservoir_cell')
+            x = layers.RNN(cell, return_sequences=True, unroll=True, trainable=False,
+                           name='reservoir')(input1)
+            if self.skip:
+                x = layers.Concatenate(name='states_and_inputs')([x, input1])
+        elif self.arch == 'no_reservoir':
+            x = input1
+        else:
+            raise ValueError('Unknown arch: {}'.format(self.arch))
+
+        if self.pool == 'logvar':
+            x = LogVariancePool(self.washout, name='logvar_pool')(x)
+        elif self.pool == 'mean':
+            x = MeanPool(self.washout, name='mean_pool')(x)
+        else:
+            raise ValueError('Unknown pool: {}'.format(self.pool))
+
+        x = layers.Dense(self.num_class, name='readout')(x)
+        softmax = layers.Activation('softmax', name='softmax')(x)
+        model = Model(inputs=input1, outputs=softmax, name=self.model_name)
+
+        if print_summary:
+            model.summary()
+        if load_weights:
+            print('loading weights from', self.weights_dir)
+            model.load_weights(self.weights_dir)
+        return model
+
+    # =========================================================================
+    #  Training: closed-form ridge readout instead of the gradient loop
+    # =========================================================================
+    def fit(self, X_train, y_train, X_val, y_val):
+        """Fit the readout by ridge regression on the training fold.
+
+        Targets are +1 for the true class and -1 otherwise; the bias is not
+        penalised. Features are standardised with training-fold statistics and
+        the standardisation is folded into the Dense weights. The validation
+        fold is only scored; its mean squared error is logged as val_loss.
+        """
+        model = self.build(print_summary=self.print_summary)
+        super().compile(model=model)
+        pool_name = 'logvar_pool' if self.pool == 'logvar' else 'mean_pool'
+        features = Model(model.input, model.get_layer(pool_name).output)
+        f_tr = features.predict(X_train, batch_size=256).astype(np.float64)
+        f_va = features.predict(X_val, batch_size=256).astype(np.float64)
+
+        if self.standardise:
+            mu, sd = f_tr.mean(axis=0), f_tr.std(axis=0) + 1e-8
+        else:
+            mu, sd = np.zeros(f_tr.shape[1]), np.ones(f_tr.shape[1])
+        y_tr, y_va = np.asarray(y_train).astype(int), np.asarray(y_val).astype(int)
+        targets = 2.0 * np.eye(self.num_class)[y_tr] - 1.0
+        a = np.c_[(f_tr - mu) / sd, np.ones(len(f_tr))]
+        penalty = self.ridge_lambda * np.eye(a.shape[1])
+        penalty[-1, -1] = 0.0
+        w = np.linalg.solve(a.T @ a + penalty, a.T @ targets)
+        kernel = w[:-1] / sd[:, None]
+        bias = w[-1] - (mu / sd) @ w[:-1]
+        model.get_layer('readout').set_weights([kernel.astype(np.float32),
+                                                bias.astype(np.float32)])
+
+        scores_tr, scores_va = f_tr @ kernel + bias, f_va @ kernel + bias
+        t_va = 2.0 * np.eye(self.num_class)[y_va] - 1.0
+        log = {'epoch': 0,
+               'train_acc': float((scores_tr.argmax(1) == y_tr).mean()),
+               'val_acc': float((scores_va.argmax(1) == y_va).mean()),
+               'val_loss': float(((scores_va - t_va) ** 2).mean()),
+               'ridge_lambda': self.ridge_lambda}
+        pd.DataFrame([log]).to_csv(self.csv_dir, index=False)
+        model.save_weights(self.weights_dir)
+        self.best_loss_weights = tf.constant([1.0])   # read by BaseModel.evaluate()
+        print('ridge readout: train_acc {:.3f} val_acc {:.3f} val_mse {:.3f}'.format(
+            log['train_acc'], log['val_acc'], log['val_loss']))
 
     # =========================================================================
     #  Provided for you -- custom training / evaluation steps
